@@ -15,6 +15,13 @@
 #include "mm.h"
 #include "memlib.h"
 
+/* 탐색 정책 설정: 1이면 Next-Fit, 0이면 First-Fit */
+#define USE_NEXT_FIT 1
+
+/* 재할당 정책 설정: 1이면 최적화 Realloc(제자리 확장/병합), 0이면 단순 Realloc(malloc+memcpy+free) */
+#define USE_OPT_REALLOC 1
+
+
 team_t team = {
     "ateam",
     "Harry Bovik",
@@ -121,7 +128,9 @@ bp - WSIZE
 #define SIZE_T_SIZE (ALIGN(sizeof(size_t)))
 
 static char *heap_listp;  /* 프롤로그 블록을 가리키는 포인터 */
-static char *last_bp; /* 마지막 탐색 지점을 가리키는 별도 포인터 */
+#if USE_NEXT_FIT
+static char *last_bp;     /* Next-fit: 마지막 탐색 지점을 가리키는 포인터 */
+#endif
 
 static void *extend_heap(size_t words);
 static void *coalesce(void *bp);
@@ -155,7 +164,9 @@ int mm_init(void)
     PUT(heap_listp + (2*WSIZE), PACK(DSIZE, 1)); /* 프롤로그 푸터 / 프롤로그 헤더 바로 뒤에 푸터 생성 */
     PUT(heap_listp + (3*WSIZE), PACK(0, 1));     /* 에필로그 헤더 / 프롤로그 푸터 바로 뒤에 에필로그 헤더 생성 */
     heap_listp += (2*WSIZE); /* 시작점 블록을 넣을 시작점 / 빈공간도 찾고 넣을곳도 정하는 포인터 */
+#if USE_NEXT_FIT
     last_bp = heap_listp;
+#endif
 
     /* CHUNKSIZE 바이트 크기의 가용 블록으로 빈 힙 확장 */
     if (extend_heap(CHUNKSIZE/WSIZE) == NULL) // 4kb 확보
@@ -238,6 +249,22 @@ static void *coalesce(void *bp)
         PUT(FTRP(NEXT_BLKP(bp)), PACK(size, 0));
         bp = PREV_BLKP(bp); // 가장 앞에 있는 이전 블록 bp 반환
     }
+
+#if USE_NEXT_FIT
+    /* 
+     * [Next-Fit last_bp 동기화 이유]
+     * 인접 블록들이 하나로 병합되면, 병합된 이전/이후 블록들의 기존 헤더 위치는
+     * 이제 하나의 커다란 새 블록의 "데이터(페이로드) 영역 한가운데"로 편입됨.
+     * 만약 last_bp가 병합된 영역 내부([bp, NEXT_BLKP(bp)))를 가리키고 있었다면,
+     * 다음 find_fit 순회 시 데이터 영역의 쓰레기 값을 블록 헤더로 잘못 읽게 됨.
+     * 이로 인해 힙 탐색이 깨지거나 이미 할당된 주소를 중복 반환하는
+     * 'Payload overlap' 치명적 오류가 발생하므로, 유효한 새 블록 시작점인 bp로 갱신함.
+     */
+    if ((char *)last_bp >= (char *)bp && (char *)last_bp < (char *)NEXT_BLKP(bp)) {
+        last_bp = bp;
+    }
+#endif
+
     return bp;
 }
 
@@ -274,64 +301,78 @@ void *mm_malloc(size_t size)
     return bp;
 }
 
-/*
- find_fit - 묵시적 가용 리스트에서 First-fit(최초 적합) 방식으로 탐색
- 순회하면서 asize에 맞는 블록 찾는 순간 반환
- */
-// static void *find_fit(size_t asize)
-// {
-//     void *bp;
-
-//     for (bp = heap_listp; GET_SIZE(HDRP(bp)) > 0; bp = NEXT_BLKP(bp)) {
-//         if (!GET_ALLOC(HDRP(bp)) && (asize <= GET_SIZE(HDRP(bp)))) {
-//             return bp;
-//         }
-//     }
-//     return NULL; /* 적합한 블록 없음 */
-// }
-static void *find_fit(size_t asize) {
-    void *bp;
+#if USE_NEXT_FIT
+/* Next-fit(다음 적합): 마지막 탐색 지점부터 순환 탐색 */
+static void *find_fit(size_t asize)
+{
+    char *bp;
 
     /* 1. last_bp부터 힙 끝(에필로그)까지 탐색 */
     for (bp = last_bp; GET_SIZE(HDRP(bp)) > 0; bp = NEXT_BLKP(bp)) {
         if (!GET_ALLOC(HDRP(bp)) && (asize <= GET_SIZE(HDRP(bp)))) {
-            last_bp = bp; // 찾은 지점 기억
             return bp;
         }
     }
 
-    /* 2. 끝까지 없으면, 힙 맨 처음(heap_listp)부터 last_bp 직전까지 순환 탐색 */
+    /* 2. 힙 맨 처음부터 last_bp 직전까지 순환 탐색 */
     for (bp = heap_listp; bp < last_bp; bp = NEXT_BLKP(bp)) {
         if (!GET_ALLOC(HDRP(bp)) && (asize <= GET_SIZE(HDRP(bp)))) {
-            last_bp = bp;
             return bp;
         }
     }
 
     return NULL; /* 진짜로 자리가 없음 */
 }
-/*
-place - 가용 블록에 요청 블록을 배치하고, 남은 크기가 최소 블록 크기 이상이면 분할
-전체 빈 공간: csize
-요청한 크기: asize
-남는 공간  : csize - asize
+#else
+/* First-fit(최초 적합): 힙 맨 처음부터 순차 탐색 */
+static void *find_fit(size_t asize)
+{
+    void *bp;
 
+    for (bp = heap_listp; GET_SIZE(HDRP(bp)) > 0; bp = NEXT_BLKP(bp)) {
+        if (!GET_ALLOC(HDRP(bp)) && (asize <= GET_SIZE(HDRP(bp)))) {
+            return bp;
+        }
+    }
+    return NULL; /* 적합한 블록 없음 */
+}
+#endif
+
+/*
+ * place - 가용 블록에 요청 블록을 배치하고, 남은 크기가 최소 블록 크기 이상이면 분할
  */
 static void place(void *bp, size_t asize)
 {
     size_t csize = GET_SIZE(HDRP(bp));
 
-    if ((csize - asize) >= (2*DSIZE)) { // 남는공간이 16b이상 크면
-        // 분할
+    if ((csize - asize) >= (2*DSIZE)) { // 남는 공간이 최소 블록 크기(16B) 이상이면 분할
         PUT(HDRP(bp), PACK(asize, 1));
         PUT(FTRP(bp), PACK(asize, 1));
-        bp = NEXT_BLKP(bp); // 분할 하고 가용공간 헤더로
+        bp = NEXT_BLKP(bp); // 분할된 가용 블록으로 이동
         PUT(HDRP(bp), PACK(csize-asize, 0));
         PUT(FTRP(bp), PACK(csize-asize, 0));
+#if USE_NEXT_FIT
+        /*
+         * [분할 시 last_bp 갱신 이유]
+         * 방금 할당된 앞쪽 블록(ALLOC=1)은 건너뛰고, 분할되어 새로 생성된
+         * 뒤쪽의 '남은 가용 블록(bp)'을 다음 탐색 시작점으로 지정함.
+         * 이렇게 해야 다음 malloc 요청 시 방금 남겨둔 빈 공간을 즉시 탐색하여 재사용할 수 있음.
+         */
+        last_bp = bp;       // 다음 탐색은 남은 가용 블록부터 시작
+#endif
     }
-    else { // 아니면 풀로
+    else { // 분할하지 않고 블록 전체 할당
         PUT(HDRP(bp), PACK(csize, 1));
         PUT(FTRP(bp), PACK(csize, 1));
+#if USE_NEXT_FIT
+        /*
+         * [미분할 시 last_bp 갱신 이유]
+         * 현재 블록 전체가 할당(ALLOC=1)되었으므로, 더 이상 빈 공간이 아님.
+         * 만약 last_bp를 그대로 두면 다음 find_fit에서 방금 할당 완료된 블록을
+         * 불필요하게 다시 검사하게 되므로, 다음 블록(NEXT_BLKP(bp))으로 넘겨줌.
+         */
+        last_bp = NEXT_BLKP(bp); // 다음 탐색은 다음 블록부터 시작
+#endif
     }
 }
 
@@ -339,58 +380,38 @@ static void place(void *bp, size_t asize)
 /*
  * mm_realloc - mm_malloc과 mm_free를 사용하여 단순하게 구현
  */
-// void *mm_realloc(void *ptr, size_t size)
-// {
-//     void *oldptr = ptr;
-//     void *newptr;
-//     size_t copySize;
-
-//     newptr = mm_malloc(size);
-//     if (newptr == NULL)
-//       return NULL;
-//     copySize = *(size_t *)((char *)oldptr - SIZE_T_SIZE); //지금 bp는 페이로드에 있으니 헤더값을 읽도록 만드는 것
-//     if (size < copySize)
-//       copySize = size;
-//     memcpy(newptr, oldptr, copySize);
-//     mm_free(oldptr);
-//     return newptr;
-// }
-
-/*
-    [케이스 1: 크기 축소 또는 유지]                                                                                                                                                                                                                                                                                        
-    현재 블록 크기 >= 요청 크기:                                                                                                                                                                                                                                                                                           
-    - 그대로 현재 ptr 반환 (남는 공간이 16바이트 이상이면 분할하여 가용 블록 생성)                                                                                                                                                                                                                                         
-                                                                                                                                                                                                                                                                                                                           
-    [케이스 2: 크기 증가 시 다음 블록과 병합]                                                                                                                                                                                                                                                                              
-    (현재 블록 크기 + 다음 블록 크기) >= 요청 크기 이고 다음 블록이 FREE 상태:                                                                                                                                                                                                                                             
-    - 다음 가용 블록을 흡수하여 현재 블록 크기를 확장 후 ptr 반환 (memcpy 불필요)                                                                                                                                                                                                                                          
-                                                                                                                                                                                                                                                                                                                           
-    [케이스 3: 다음 블록이 힙 끝(에필로그)인 경우 (선택 최적화)]                                                                                                                                                                                                                                                           
-    다음 블록의 헤더 크기가 0 (에필로그):                                                                                                                                                                                                                                                                                  
-    - mem_sbrk로 부족한 만큼만 힙을 늘려서 제자리 확장                                                                                                                                                                                                                                                                     
-                                                                                                                                                                                                                                                                                                                           
-    [케이스 4: 위 조건 모두 불가능할 때만]                                                                                                                                                                                                                                                                                 
-    - 새로 mm_malloc -> memcpy -> mm_free 수행    
-*/
 void *mm_realloc(void *ptr, size_t size)
 {
+#if USE_OPT_REALLOC
+    /*
+     * [최적화 Realloc (USE_OPT_REALLOC = 1)]
+     * 1) 크기 축소/유지: 제자리 반환 + 16B 이상 남으면 분할
+     * 2) 다음 블록이 가용 블록: 흡수하여 크기 충족 시 memcpy 없이 제자리 확장
+     * 3) 다음 블록이 에필로그: 힙 끝 부족분만 mem_sbrk로 늘려 memcpy 없이 제자리 확장
+     * 4) 불가피할 때만 새로 malloc -> memcpy -> free 수행
+     */
     void *oldptr = ptr;
     void *newptr;
     size_t copySize;
 
-    if(size == 0) { mm_free(ptr); return NULL; }
-    if(!ptr) return mm_malloc(size);
+    if (size == 0) {
+        mm_free(ptr);
+        return NULL;
+    }
+    if (!ptr)
+        return mm_malloc(size);
 
     size_t csize = GET_SIZE(HDRP(oldptr));
     size_t asize;
     if (size <= DSIZE) {
         asize = 2 * DSIZE;
     }
-    else{
+    else {
         asize = DSIZE * ((size + DSIZE + (DSIZE - 1)) / DSIZE);
     }
     
-    if (csize >= asize) { // 현재 블록 크기 >= 요청 크기
+    /* 케이스 1: 현재 블록 크기 >= 요청 크기 (축소 또는 유지) */
+    if (csize >= asize) {
         if ((csize - asize) >= (2 * DSIZE)) {
             PUT(HDRP(oldptr), PACK(asize, 1));
             PUT(FTRP(oldptr), PACK(asize, 1));
@@ -400,8 +421,9 @@ void *mm_realloc(void *ptr, size_t size)
             PUT(FTRP(next_bp), PACK(csize - asize, 0));
             coalesce(next_bp); // 뒤쪽 블록 가용 병합
         }
+        return oldptr;
     }
-    /* [케이스 2: 크기 증가 시 다음 블록이 FREE이고 합쳐서 충분할 때 병합] */
+    /* 케이스 2: 다음 블록이 FREE이고 합쳐서 충분할 때 병합 */
     else if (!GET_ALLOC(HDRP(NEXT_BLKP(oldptr))) && (csize + GET_SIZE(HDRP(NEXT_BLKP(oldptr)))) >= asize) {
         size_t total_size = csize + GET_SIZE(HDRP(NEXT_BLKP(oldptr)));
         if ((total_size - asize) >= (2 * DSIZE)) {
@@ -418,7 +440,7 @@ void *mm_realloc(void *ptr, size_t size)
         }
         return oldptr;
     }
-    /* [케이스 3: 다음 블록이 힙 끝(에필로그 헤더)인 경우 제자리 확장] */
+    /* 케이스 3: 다음 블록이 힙 끝(에필로그 헤더)인 경우 제자리 확장 */
     else if (GET_SIZE(HDRP(NEXT_BLKP(oldptr))) == 0) {
         size_t extend_size = asize - csize;
         if ((long)(mem_sbrk(extend_size)) == -1)
@@ -429,12 +451,12 @@ void *mm_realloc(void *ptr, size_t size)
         PUT(HDRP(NEXT_BLKP(oldptr)), PACK(0, 1)); // 새로운 에필로그 헤더 설정
         return oldptr;
     }
+    /* 케이스 4: 위 조건 모두 불가능할 때 새로 할당 후 복사 */
     else {
         newptr = mm_malloc(size);
         if (newptr == NULL)
             return NULL;
 
-        /* 복사할 크기는 기존 페이로드 크기(csize - DSIZE)와 새 요청 크기(size) 중 작은 값으로 설정 */
         copySize = csize - DSIZE;
         if (size < copySize)
             copySize = size;
@@ -442,6 +464,27 @@ void *mm_realloc(void *ptr, size_t size)
         mm_free(oldptr);
         return newptr;
     }
-    
-    return oldptr;
+#else
+    /*
+     * [단순 Naive Realloc (USE_OPT_REALLOC = 0)]
+     * 크기 증감과 무관하게 항상 새 블록을 malloc 후 페이로드를 복사하고 기존 블록 free
+     */
+    if (ptr == NULL)
+        return mm_malloc(size);
+
+    if (size == 0) {
+        mm_free(ptr);
+        return NULL;
+    }
+
+    void *newptr = mm_malloc(size);
+    if (newptr == NULL)
+        return NULL;
+
+    size_t oldSize = GET_SIZE(HDRP(ptr)) - DSIZE;
+    size_t copySize = (size < oldSize) ? size : oldSize;
+    memcpy(newptr, ptr, copySize);
+    mm_free(ptr);
+    return newptr;
+#endif
 }

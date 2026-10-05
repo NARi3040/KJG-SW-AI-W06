@@ -1,10 +1,11 @@
 /*
  * viz.c - Advanced heap visualizer + checker for Malloc Lab. Does NOT touch mm.c.
  *
- * Linker --wrap intercepts the driver's mm_malloc/mm_free/mm_realloc calls,
+ * Linker --wrap intercepts the driver's mm_init/mm_malloc/mm_free/mm_realloc calls,
  * runs the real ones, dumps the heap to stderr, tracks stats and checks invariants.
- * Problems print in bold red. On SIGSEGV/SIGBUS it prints the faulting call,
- * fault address, recent operations history, and the heap state at crash.
+ * Problems print in bold red. On SIGSEGV/SIGBUS/SIGABRT/SIGFPE/SIGILL it prints the
+ * faulting call, fault address, recent operations history, a backtrace and the heap
+ * state at crash.
  *
  * Build:
  *   make -f Makefile.viz
@@ -21,15 +22,28 @@
  *   VIZ_OP=15 ./mdriver-viz ...                        Dump only operation 15
  *   VIZ_LINK=1 ./mdriver-viz ...                       Show explicit free list link hints (next/prev)
  *
+ * Source locations: crashes print the faulting file:line and a resolved call stack; heap
+ * errors print where the driver called mm_* and where that entry point is implemented
+ * (addr2line, needs -g).
+ *
+ * Debugging options:
+ *   VIZ_STOP=1 ./mdriver-viz ...                       abort() at the first detected problem
+ *                                                      (core dump, or break inside gdb)
+ *
  * Advanced features:
- *   - Recent operation history ring buffer (printed on crash)
+ *   - Recent operation history ring buffer (printed on crash and on the first error)
  *   - External fragmentation & memory utilization profiling
- *   - Unfreed block / memory leak detector on exit
- *   - Free block explicit list (next/prev pointer) heuristic inspection
+ *   - Live block table: overlapping allocations, free of a pointer that malloc never
+ *     returned, NULL returns for non-zero requests
+ *   - Per-run report (state is reset at every mm_init): leak list with the op that
+ *     allocated each block
+ *   - Free block explicit list (next/prev pointer) heuristic inspection + validation
  *   - Double-free, invalid pointer, alignment, heap-boundary checks
  *   - Header/footer consistency & coalescing verification
+ *   - Crash backtrace (link with -rdynamic for symbol names)
  */
 
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -37,10 +51,16 @@
 #include <stdint.h>
 #include <signal.h>
 #include <unistd.h>
+#include <execinfo.h>
+#include <dlfcn.h>
+#include <elf.h>
+#include <ucontext.h>
 
 #include "mm.h"
 #include "memlib.h"
 
+FILE *__real_fopen(const char *path, const char *mode);
+int __real_mm_init(void);
 void *__real_mm_malloc(size_t size);
 void __real_mm_free(void *ptr);
 void *__real_mm_realloc(void *ptr, size_t size);
@@ -67,13 +87,20 @@ static size_t cur_n = 0;
 static void *cur_ptr = NULL;
 
 /* problems found in the current call */
-static char errs[32][128];
-static int nerr = 0, total_err = 0, nops = 0;
+#define ERR_CAP 32
+static char errs[ERR_CAP][160];
+static int nerr = 0;
+static int err_muted = 0;     /* set during the print pass so errors are not collected twice */
+
+/* counters: total_* are over the whole process, run_err/nops are per mm_init run */
+static int total_err = 0, run_err = 0, nops = 0;
+static int total_runs = 0, total_calls = 0;
 
 /* filter range */
 static int filter_start = -1;
 static int filter_end = -1;
 static int show_link_hints = -1;
+static int stop_on_error = 0;
 
 /* ring buffer for recent operations */
 #define RING_CAP 16
@@ -134,6 +161,197 @@ static void print_ring_history(void)
     fprintf(stderr, "\033[1;33m-------------------------------------------------\033[0m\n");
 }
 
+/* live (allocated, not yet freed) blocks as seen through the wrappers */
+typedef struct {
+    char *bp;
+    size_t n;     /* requested payload size */
+    int op;       /* op number that produced this block */
+} live_t;
+
+static live_t *live = NULL;
+static int nlive = 0, cap_live = 0;
+
+static int live_find(void *bp)
+{
+    for (int i = 0; i < nlive; i++)
+        if (live[i].bp == (char *)bp)
+            return i;
+    return -1;
+}
+
+/* index of a live block whose payload [bp, bp+n) overlaps [bp, bp+n) of the argument */
+static int live_overlap(void *bp, size_t n)
+{
+    char *a = (char *)bp;
+    for (int i = 0; i < nlive; i++)
+        if (a < live[i].bp + live[i].n && live[i].bp < a + n)
+            return i;
+    return -1;
+}
+
+static void live_add(void *bp, size_t n, int op)
+{
+    if (nlive == cap_live) {
+        int ncap = cap_live ? cap_live * 2 : 256;
+        live_t *nl = realloc(live, ncap * sizeof *live);
+        if (!nl)
+            return;               /* tracking is best-effort */
+        live = nl;
+        cap_live = ncap;
+    }
+    live[nlive].bp = (char *)bp;
+    live[nlive].n = n;
+    live[nlive].op = op;
+    nlive++;
+}
+
+static void live_del(int i)
+{
+    live[i] = live[nlive - 1];    /* order is not needed except for leak listing */
+    nlive--;
+}
+
+/*
+ * Source location lookup: addr -> "func at file:line" via addr2line on our own executable.
+ * Needs the program built with -g (Makefile.viz does). Returns NULL if unknown.
+ */
+static char exe_path[4096];
+static int exe_is_pie = 1;
+static void *exe_base = NULL;
+
+static void init_exe_info(void)
+{
+    ssize_t n = readlink("/proc/self/exe", exe_path, sizeof exe_path - 1);
+    Dl_info di;
+    FILE *f;
+    Elf64_Ehdr eh;
+
+    exe_path[n > 0 ? n : 0] = 0;
+    if (dladdr((void *)init_exe_info, &di))
+        exe_base = di.dli_fbase;
+    if (n > 0 && (f = fopen(exe_path, "rb"))) {
+        if (fread(&eh, sizeof eh, 1, f) == 1)
+            exe_is_pie = (eh.e_type != ET_EXEC);
+        fclose(f);
+    }
+}
+
+/* is_ret: addr is a return address (look up the call instruction, not the next one) */
+static const char *resolve(void *addr, int is_ret)
+{
+    enum { CACHE = 64 };
+    static struct { void *addr; int ret; char txt[300]; int ok; } cache[CACHE];
+    static int ncache = 0;
+    static char overflow[300];
+    Dl_info di;
+    char cmd[4400], line[300], *nl, *cwd_pfx;
+    char cwd[1024];
+    unsigned long off;
+    FILE *fp;
+
+    for (int i = 0; i < ncache; i++)
+        if (cache[i].addr == addr && cache[i].ret == is_ret)
+            return cache[i].ok ? cache[i].txt : NULL;
+
+    if (!addr || !exe_path[0] || !dladdr(addr, &di) || di.dli_fbase != exe_base)
+        return NULL;                       /* libc, vdso, ... */
+    off = (unsigned long)addr - (is_ret ? 1 : 0);
+    if (exe_is_pie)
+        off -= (unsigned long)exe_base;
+    snprintf(cmd, sizeof cmd, "addr2line -e '%s' -f -C -p 0x%lx 2>/dev/null", exe_path, off);
+
+    line[0] = 0;
+    if ((fp = popen(cmd, "r"))) {
+        if (!fgets(line, sizeof line, fp))
+            line[0] = 0;
+        pclose(fp);
+    }
+    if ((nl = strchr(line, '\n')))
+        *nl = 0;
+
+    if ((nl = strstr(line, " (discriminator")))
+        *nl = 0;
+    int ok = line[0] && !strstr(line, "??");
+    if (ok && getcwd(cwd, sizeof cwd) && (cwd_pfx = strstr(line, cwd)) && cwd[1]) {
+        size_t l = strlen(cwd);       /* show paths relative to the cwd */
+        char *src = cwd_pfx + l + (cwd_pfx[l] == '/');
+        memmove(cwd_pfx, src, strlen(src) + 1);
+    }
+    if (ncache < CACHE) {
+        cache[ncache].addr = addr;
+        cache[ncache].ret = is_ret;
+        snprintf(cache[ncache].txt, sizeof cache[ncache].txt, "%s", line);
+        cache[ncache].ok = ok;
+        return ok ? cache[ncache++].txt : (ncache++, NULL);
+    }
+    snprintf(overflow, sizeof overflow, "%s", line);   /* cache full: result valid until next call */
+    return ok ? overflow : NULL;
+}
+
+/* where the driver called mm_*, and the entry point being exercised (set by the wrappers) */
+static void *cur_site = NULL;
+static void *cur_entry = NULL;
+static const char *ctx_op = "";   /* last wrapped op, kept after the call for error reports */
+
+/*
+ * Test case tracking. mdriver opens each .rep trace with fopen right before running it
+ * (wrapped below), and calls mm_init from eval_mm_valid / eval_mm_util / eval_mm_speed.
+ * Op #N of a run is trace line N+4 (the file has a 4-line header).
+ */
+#define TRACE_HDR_LINES 4
+static char last_opened[512];     /* most recent *.rep passed to fopen */
+static char cur_trace[512];       /* trace of the current run */
+static char cur_phase[64];        /* mdriver function that started the run */
+static int op_in_flight = 0;      /* op number of the wrapped call being executed */
+static char failed_traces[16][64];
+static int nfailed = 0;
+
+static void mark_failed(const char *path);
+
+static const char *base_name(const char *path)
+{
+    const char *b = strrchr(path, '/');
+    return b ? b + 1 : path;
+}
+
+static void mark_failed(const char *path)
+{
+    const char *n = base_name(path);
+    for (int i = 0; i < nfailed; i++)
+        if (!strcmp(failed_traces[i], n))
+            return;
+    if (nfailed < 16)
+        snprintf(failed_traces[nfailed++], sizeof failed_traces[0], "%.63s", n);
+}
+
+static int trace_line_text(int opnum, char *out, size_t cap)
+{
+    FILE *f;
+    int ok = 0;
+    if (!cur_trace[0] || opnum < 1 || !(f = __real_fopen(cur_trace, "r")))
+        return 0;
+    for (int i = 0; i < opnum + TRACE_HDR_LINES; i++)
+        if (!fgets(out, cap, f))
+            goto done;
+    out[strcspn(out, "\r\n")] = 0;
+    ok = 1;
+done:
+    fclose(f);
+    return ok;
+}
+
+static void print_trace_ctx(const char *color)
+{
+    char t[128];
+    if (!cur_trace[0])
+        return;
+    fprintf(stderr, "%s    test case: %s (%s)", color, base_name(cur_trace), cur_phase);
+    if (trace_line_text(op_in_flight, t, sizeof t))
+        fprintf(stderr, ", op #%d = %s line %d: '%s'", op_in_flight, base_name(cur_trace),
+                op_in_flight + TRACE_HDR_LINES, t);
+    fprintf(stderr, "\033[0m\n");
+}
+
 static enum viz_mode get_mode(void)
 {
     static int cached_mode = -1;
@@ -163,10 +381,12 @@ static void init_filters(void)
         const char *e = getenv("VIZ_END");
         const char *o = getenv("VIZ_OP");
         const char *l = getenv("VIZ_LINK");
+        const char *st = getenv("VIZ_STOP");
         if (s) filter_start = atoi(s);
         if (e) filter_end = atoi(e);
         if (o) { filter_start = atoi(o); filter_end = atoi(o); }
         if (l) show_link_hints = atoi(l);
+        if (st) stop_on_error = atoi(st);
         initialized = 1;
     }
 }
@@ -176,20 +396,22 @@ static int should_print(int is_error_occurred)
     enum viz_mode mode = get_mode();
     init_filters();
 
+    if (mode == MODE_ERROR)
+        return is_error_occurred;
+
     if (filter_start >= 0 && nops < filter_start)
         return 0;
     if (filter_end >= 0 && nops > filter_end)
         return 0;
-
-    if (mode == MODE_ERROR)
-        return is_error_occurred;
 
     return 1;
 }
 
 static void err(const char *fmt, ...)
 {
-    if (nerr < 32) {
+    if (err_muted)
+        return;
+    if (nerr < ERR_CAP) {
         va_list ap;
         va_start(ap, fmt);
         vsnprintf(errs[nerr], sizeof errs[0], fmt, ap);
@@ -202,14 +424,31 @@ static void flush_errs(void)
 {
     if (!nerr)
         return;
+    int first = (run_err == 0);
     fprintf(stderr, "\033[1;31m");
-    for (int i = 0; i < nerr && i < 32; i++)
+    for (int i = 0; i < nerr && i < ERR_CAP; i++)
         fprintf(stderr, " !! %s\n", errs[i]);
-    if (nerr > 32)
-        fprintf(stderr, " !! ... and %d more\n", nerr - 32);
+    if (nerr > ERR_CAP)
+        fprintf(stderr, " !! ... and %d more\n", nerr - ERR_CAP);
     fprintf(stderr, "\033[0m");
+    {
+        const char *site = resolve(cur_site, 1), *impl = resolve(cur_entry, 0);
+        fprintf(stderr, "\033[31m    while running op #%d %s(): called at %s\n"
+                        "    implemented at %s\033[0m\n",
+                op_in_flight, ctx_op, site ? site : "?", impl ? impl : "? (build mm.c with -g)");
+        print_trace_ctx("\033[31m");
+    }
     total_err += nerr;
+    run_err += nerr;
     nerr = 0;
+
+    if (first)                    /* context for the first problem of the run only */
+        print_ring_history();
+    if (stop_on_error) {
+        fprintf(stderr, "\033[1;31mviz: VIZ_STOP set, aborting at first problem (op #%d)\033[0m\n", op_in_flight);
+        signal(SIGABRT, SIG_DFL);
+        abort();
+    }
 }
 
 #define OFF(p) ((long)((char *)(p) - lo))
@@ -222,6 +461,28 @@ typedef struct {
     int num_free;
 } heap_stats_t;
 
+/* is q the start of a plausible free block? (for explicit free list link validation) */
+static int link_ok(void *q, char *lo, char *hi)
+{
+    char *b = (char *)q;
+    if (b < lo + 12 || b > hi || (uintptr_t)b % 8)
+        return 0;
+    return !ALLOC(b) && SIZE(b) >= 16 && b + SIZE(b) - 4 <= hi + 1;
+}
+
+/* format one free-list link: NULL / +0xOFF / BAD(+0xOFF) (in heap, not a free block) / ?ptr (not in heap) */
+static void fmt_link(char *out, size_t cap, void *q, char *lo, char *hi)
+{
+    if (!q)
+        snprintf(out, cap, "NULL");
+    else if ((char *)q < lo || (char *)q > hi)
+        snprintf(out, cap, "?%p", q);
+    else if (link_ok(q, lo, hi))
+        snprintf(out, cap, "+0x%lx", (long)((char *)q - lo));
+    else
+        snprintf(out, cap, "BAD(+0x%lx)", (long)((char *)q - lo));
+}
+
 /* Walk and check heap, and optionally print visualization */
 static void walk(void *chk, int mode, size_t n, int do_print)
 {
@@ -229,6 +490,8 @@ static void walk(void *chk, int mode, size_t n, int do_print)
     int prev_alloc = 1, found = 0;
     char *lo = (char *)mem_heap_lo(), *hi = (char *)mem_heap_hi(), *p = lo + 8;
     heap_stats_t st = {0, 0, 0, 0, 0};
+
+    init_filters();
 
     if (mem_heapsize() < 16 || HDR(p) != 9) {   /* prologue = size 8, alloc */
         if (do_print)
@@ -280,21 +543,17 @@ static void walk(void *chk, int mode, size_t n, int do_print)
                 else
                     fprintf(stderr, "\033[42;30m[%zuF]\033[0m", s);
             } else if (vmode == MODE_TABLE || vmode == MODE_ERROR || vmode == MODE_STEP) {
-                char detail[64] = {0};
+                char detail[96] = {0};
                 if (p == lo + 8)
                     snprintf(detail, sizeof(detail), "(prologue)");
                 else if (s == 0)
                     snprintf(detail, sizeof(detail), "(epilogue)");
-                else if (!is_alloc && (show_link_hints > 0 || getenv("VIZ_LINK"))) {
+                else if (!is_alloc && show_link_hints > 0) {
                     /* Heuristic: check if first words look like heap pointers (explicit free list) */
-                    if (s >= 16) {
-                        void *succ = *(void **)p;
-                        void *pred = *(void **)(p + sizeof(void *));
-                        char succ_str[24] = "NULL", pred_str[24] = "NULL";
-                        if (succ && (char *)succ >= lo && (char *)succ <= hi)
-                            snprintf(succ_str, sizeof(succ_str), "+0x%lx", (long)((char *)succ - lo));
-                        if (pred && (char *)pred >= lo && (char *)pred <= hi)
-                            snprintf(pred_str, sizeof(pred_str), "+0x%lx", (long)((char *)pred - lo));
+                    if (s >= 24 && p + 16 <= hi + 1) {
+                        char succ_str[32], pred_str[32];
+                        fmt_link(succ_str, sizeof succ_str, *(void **)p, lo, hi);
+                        fmt_link(pred_str, sizeof pred_str, *(void **)(p + sizeof(void *)), lo, hi);
                         snprintf(detail, sizeof(detail), "next=%s, prev=%s", succ_str, pred_str);
                     }
                 }
@@ -362,10 +621,13 @@ static void walk(void *chk, int mode, size_t n, int do_print)
                 st.alloc_bytes, st.num_alloc, st.free_bytes, st.num_free,
                 st.max_free_bytes, ext_frag, util);
     }
-
-    flush_errs();
 }
 
+/*
+ * Called after the real call. The invariant check runs first (errors are collected,
+ * not printed), then the dump is printed if mode/filters allow, then errors are
+ * flushed under the dump so they are not interleaved with the table.
+ */
 static void dump(const char *op, size_t n, void *bp, int mode)
 {
     nops++;
@@ -383,13 +645,19 @@ static void dump(const char *op, size_t n, void *bp, int mode)
         else
             fprintf(stderr, "[#%-4d %s %zu] bp=NULL  heap=%zuB\n", nops, op, n, mem_heapsize());
 
+        err_muted = 1;            /* the same problems were already collected above */
         walk(bp, bp ? mode : CHK_NONE, n, 1);
+        err_muted = 0;
+
+        flush_errs();
 
         if (get_mode() == MODE_STEP && isatty(fileno(stdin))) {
             fprintf(stderr, "\033[1;36m[STEP] Press Enter to continue...\033[0m");
             int c;
             while ((c = getchar()) != '\n' && c != EOF);
         }
+    } else {
+        flush_errs();
     }
 }
 
@@ -406,9 +674,23 @@ static int pre_free(const char *op, void *ptr)
         err("%s(+0x%lx): pointer is not 8-aligned", op, OFF(ptr));
     else if (!ALLOC(ptr))
         err("%s(+0x%lx): block is already free (double free?)", op, OFF(ptr));
+    else if (live_find(ptr) < 0)
+        err("%s(+0x%lx): not the start of a live block (never returned by malloc/realloc?)",
+            op, OFF(ptr));
     bad = nerr;
     flush_errs();
     return bad;
+}
+
+/* record a block handed out by malloc/realloc, reporting payload overlap with live blocks */
+static void track_new(const char *op, void *bp, size_t n)
+{
+    char *lo = (char *)mem_heap_lo();
+    int i = live_overlap(bp, n);
+    if (i >= 0)
+        err("%s(%zu) = +0x%lx overlaps live block +0x%lx (%zuB, allocated at op #%d)",
+            op, n, OFF(bp), OFF(live[i].bp), live[i].n, live[i].op);
+    live_add(bp, n, nops + 1);
 }
 
 /* print an address as heap offset when inside the heap */
@@ -423,99 +705,233 @@ static void where(const char *label, void *a)
         fprintf(stderr, "  %s: %p (OUTSIDE heap %p..%p)\n", label, a, (void *)lo, (void *)hi);
 }
 
+static const char *sig_name(int sig)
+{
+    switch (sig) {
+    case SIGSEGV: return "SIGSEGV";
+    case SIGBUS:  return "SIGBUS";
+    case SIGABRT: return "SIGABRT";
+    case SIGFPE:  return "SIGFPE";
+    case SIGILL:  return "SIGILL";
+    default:      return "signal";
+    }
+}
+
 /* fprintf is not async-signal-safe; fine for a debug crash report */
 static void on_crash(int sig, siginfo_t *si, void *ctx)
 {
+    void *bt[32];
+    int nbt, shown = 0;
+    const char *loc;
+    void *pc = NULL;
+#if defined(__x86_64__)
+    pc = (void *)((ucontext_t *)ctx)->uc_mcontext.gregs[REG_RIP];
+#elif defined(__aarch64__)
+    pc = (void *)((ucontext_t *)ctx)->uc_mcontext.pc;
+#else
     (void)ctx;
-    fprintf(stderr, "\n\033[1;31m*** CRASH: %s ***\033[0m\n", sig == SIGSEGV ? "SIGSEGV" : "SIGBUS");
+#endif
+
+    fprintf(stderr, "\n\033[1;31m*** CRASH: %s ***\033[0m\n", sig_name(sig));
     if (cur_op)
-        fprintf(stderr, "  in %s(%zu)\n", cur_op, cur_n);
+        fprintf(stderr, "  in op #%d: %s(%zu)\n", op_in_flight, cur_op, cur_n);
     else
         fprintf(stderr, "  outside mm_* call (driver code, or after return)\n");
 
+    loc = resolve(pc, 0);
+    if (loc)
+        fprintf(stderr, "  \033[1;31mfaulted at: %s\033[0m\n", loc);
+    else if (pc)
+        fprintf(stderr, "  faulted at: %p (not in this program: libc? stack overflow in mm?)\n", pc);
+    if (cur_op)
+        print_trace_ctx("\033[1;31m");
+    else if (cur_trace[0])
+        fprintf(stderr, "  test case: %s (%s)\n", base_name(cur_trace), cur_phase);
     where("fault addr", si->si_addr);
     if (cur_op)
         where("arg ptr   ", cur_ptr);
 
     print_ring_history();
 
+    nbt = backtrace(bt, 32);
+    fprintf(stderr, "\n\033[1;33m--- Call stack (innermost first) ---\033[0m\n");
+    for (int i = 1; i < nbt; i++) {          /* frame 0 is this handler */
+        const char *f = resolve(bt[i], 1);
+        if (f)
+            fprintf(stderr, "  #%d %s\n", shown++, f);
+    }
+    if (!shown) {
+        fprintf(stderr, "  (no source info; raw frames:)\n");
+        fflush(stderr);
+        backtrace_symbols_fd(bt, nbt, STDERR_FILENO);
+    }
+    fprintf(stderr, "\033[1;33m-------------------------------------\033[0m\n");
+
+    if (cur_trace[0] && (run_err || cur_op))
+        mark_failed(cur_trace);
+    if (nfailed) {
+        fprintf(stderr, "\n\033[1;31mviz: test case(s) with heap problems before/at crash:");
+        for (int i = 0; i < nfailed; i++)
+            fprintf(stderr, " %s", failed_traces[i]);
+        fprintf(stderr, "\033[0m\n");
+    }
+
     fprintf(stderr, "\nHeap state at crash:\n");
+    err_muted = 0;
     walk(NULL, CHK_NONE, 0, 1);
+    flush_errs();
     /* SA_RESETHAND: returning re-faults with the default action (core/exit) */
 }
 
-/* Report unfreed blocks / memory leaks at program exit */
-static void check_leaks(void)
+/* Per-run report (leaks + verdict), then reset per-run state */
+static int leak_reported = 0;
+
+static void run_report(void)
 {
-    char *lo = (char *)mem_heap_lo(), *hi = (char *)mem_heap_hi(), *p = lo + 8;
-    if (mem_heapsize() < 16 || HDR(p) != 9)
+    char *lo = (char *)mem_heap_lo();
+
+    if (nops == 0 && nlive == 0)
         return;
 
-    int leak_count = 0;
-    size_t leak_bytes = 0;
-
-    for (;; p += SIZE(p)) {
-        size_t s = SIZE(p);
-        if (s == 0 || p + s > hi + 1)
-            break;
-        if (p != lo + 8 && ALLOC(p)) {   /* Exclude prologue */
-            leak_count++;
-            leak_bytes += s;
-        }
+    if (nlive > 0 && !leak_reported) {
+        leak_reported = 1;       /* timing re-runs would repeat the same list */
+        size_t leak_bytes = 0;
+        for (int i = 0; i < nlive; i++)
+            leak_bytes += live[i].n;
+        fprintf(stderr, "\033[1;33mviz: [Leak Detector] %d unfreed block(s) remaining (%zu payload bytes total)\033[0m\n",
+                nlive, leak_bytes);
+        for (int i = 0; i < nlive && i < 10; i++)
+            fprintf(stderr, "\033[33m  leak: +0x%lx  %zuB  (allocated at op #%d)\033[0m\n",
+                    OFF(live[i].bp), live[i].n, live[i].op);
+        if (nlive > 10)
+            fprintf(stderr, "\033[33m  ... and %d more\033[0m\n", nlive - 10);
     }
 
-    if (leak_count > 0) {
-        fprintf(stderr, "\033[1;33mviz: [Leak Detector] %d unfreed block(s) remaining (%zu bytes total)\033[0m\n",
-                leak_count, leak_bytes);
+    /* mdriver re-runs the trace many times while timing, so only problems print per run */
+    if (run_err)
+    {
+        fprintf(stderr, "\033[1;31mviz: run %d [%s, %s]: %d heap problem(s) over %d calls\033[0m\n",
+                total_runs + 1, base_name(cur_trace), cur_phase, run_err, nops);
+        mark_failed(cur_trace);
     }
+    total_runs++;
+    total_calls += nops;
+
+    nops = 0;
+    nlive = 0;
+    run_err = 0;
+    op_ring_count = 0;
+    op_ring_head = 0;
 }
 
 static void summary(void)
 {
-    check_leaks();
+    run_report();
     if (total_err)
-        fprintf(stderr, "\033[1;31mviz: %d heap problem(s) over %d calls\033[0m\n", total_err, nops);
+    {
+        fprintf(stderr, "\033[1;31mviz: %d heap problem(s) over %d calls (%d run(s))\033[0m\n",
+                total_err, total_calls, total_runs);
+        fprintf(stderr, "\033[1;31mviz: failing test case(s):");
+        for (int i = 0; i < nfailed; i++)
+            fprintf(stderr, " %s", failed_traces[i]);
+        fprintf(stderr, "\033[0m\n");
+    }
     else
-        fprintf(stderr, "\033[1;32mviz: heap OK over %d calls\033[0m\n", nops);
+        fprintf(stderr, "\033[1;32mviz: heap OK over %d calls (%d run(s))\033[0m\n",
+                total_calls, total_runs);
 }
 
 __attribute__((constructor)) static void install(void)
 {
+    static const int sigs[] = { SIGSEGV, SIGBUS, SIGABRT, SIGFPE, SIGILL };
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
     sa.sa_sigaction = on_crash;
     sa.sa_flags = SA_SIGINFO | SA_RESETHAND;
     sigemptyset(&sa.sa_mask);
-    sigaction(SIGSEGV, &sa, NULL);
-    sigaction(SIGBUS, &sa, NULL);
+    init_exe_info();
+    for (size_t i = 0; i < sizeof sigs / sizeof sigs[0]; i++)
+        sigaction(sigs[i], &sa, NULL);
     atexit(summary);
+}
+
+/* each mm_init starts a new run: report the previous one, then reset */
+int __wrap_mm_init(void)
+{
+    const char *f = resolve(__builtin_return_address(0), 1), *at;
+    run_report();
+    snprintf(cur_trace, sizeof cur_trace, "%s", last_opened);
+    snprintf(cur_phase, sizeof cur_phase, "%s", f ? f : "?");
+    if ((at = strstr(cur_phase, " at ")))
+        cur_phase[at - cur_phase] = 0;
+    return __real_mm_init();
+}
+
+/* remember which trace file the driver is about to run */
+FILE *__wrap_fopen(const char *path, const char *mode)
+{
+    size_t l = strlen(path);
+    if (l > 4 && !strcmp(path + l - 4, ".rep"))
+        snprintf(last_opened, sizeof last_opened, "%s", path);
+    return __real_fopen(path, mode);
 }
 
 void *__wrap_mm_malloc(size_t size)
 {
-    cur_op = "malloc"; cur_n = size; cur_ptr = NULL;
+    op_in_flight = nops + 1;
+    cur_op = ctx_op = "malloc"; cur_n = size; cur_ptr = NULL;
+    cur_site = __builtin_return_address(0); cur_entry = (void *)__real_mm_malloc;
     void *bp = __real_mm_malloc(size);
     cur_op = NULL;
+    if (bp)
+        track_new("malloc", bp, size);
+    else if (size)
+        err("malloc(%zu) returned NULL", size);
     dump("malloc", size, bp, CHK_ALLOC);
     return bp;
 }
 
 void __wrap_mm_free(void *ptr)
 {
+    op_in_flight = nops + 1;
+    cur_site = __builtin_return_address(0); cur_entry = (void *)__real_mm_free;
+    ctx_op = "free";
     int bad = pre_free("free", ptr);
     size_t n = ptr && !bad ? SIZE(ptr) : 0;
-    cur_op = "free"; cur_n = n; cur_ptr = ptr;
+    cur_op = ctx_op = "free"; cur_n = n; cur_ptr = ptr;
+    cur_site = __builtin_return_address(0); cur_entry = (void *)__real_mm_free;
     __real_mm_free(ptr);
     cur_op = NULL;
+    if (ptr && !bad) {
+        int i = live_find(ptr);
+        if (i >= 0)
+            live_del(i);
+    }
     dump("free", n, ptr, CHK_FREED);
 }
 
 void *__wrap_mm_realloc(void *ptr, size_t size)
 {
-    pre_free("realloc", ptr);
+    cur_site = __builtin_return_address(0); cur_entry = (void *)__real_mm_realloc;
+    op_in_flight = nops + 1;
+    ctx_op = "realloc";
+    int bad = pre_free("realloc", ptr);
     cur_op = "realloc"; cur_n = size; cur_ptr = ptr;
     void *bp = __real_mm_realloc(ptr, size);
     cur_op = NULL;
+
+    int old = (ptr && !bad) ? live_find(ptr) : -1;
+    if (size == 0) {                      /* realloc(ptr, 0) == free(ptr) */
+        if (old >= 0)
+            live_del(old);
+    } else if (bp) {
+        if (old >= 0)
+            live_del(old);                /* old payload may legitimately be reused */
+        track_new("realloc", bp, size);
+    } else {
+        err("realloc(%zu) returned NULL", size);   /* old block stays live */
+    }
+
     dump("realloc", size, bp, size ? CHK_ALLOC : CHK_NONE);
     return bp;
 }

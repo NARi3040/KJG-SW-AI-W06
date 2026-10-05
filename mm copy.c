@@ -125,42 +125,23 @@ static char *last_bp; /* 마지막 탐색 지점을 가리키는 별도 포인�
 
 static void *extend_heap(size_t words);
 static void *coalesce(void *bp);
-static void *find_fit(size_t asize);
-static void place(void *bp, size_t asize);
-
-/*
-세팅
-void mem_init(void);               
-void mem_deinit(void);
-void *mem_sbrk(int incr);
-void mem_reset_brk(void); 
-void *mem_heap_lo(void);
-void *mem_heap_hi(void);
-size_t mem_heapsize(void);
-size_t mem_pagesize(void);
-
-*/
-
-/* 
- mm_init - malloc 패키지 초기화
- 순서: 초기힙 생성 - 4b 패딩 후, 프롤로그, 에필로그 8b 및 시작점 설정 - 빈 힙 확장
- */
-int mm_init(void)
+static void *find_fit(size_t asize)
 {
-    /* 초기 빈 힙 생성 */
-    if ((heap_listp = mem_sbrk(4*WSIZE)) == (void *)-1)
-        return -1;
-    PUT(heap_listp, 0);                          /* 정렬 패딩 */
-    PUT(heap_listp + (1*WSIZE), PACK(DSIZE, 1)); /* 프롤로그 헤더 / 4바이트 패딩 두고 프롤로그 헤더 생성 */
-    PUT(heap_listp + (2*WSIZE), PACK(DSIZE, 1)); /* 프롤로그 푸터 / 프롤로그 헤더 바로 뒤에 푸터 생성 */
-    PUT(heap_listp + (3*WSIZE), PACK(0, 1));     /* 에필로그 헤더 / 프롤로그 푸터 바로 뒤에 에필로그 헤더 생성 */
-    heap_listp += (2*WSIZE); /* 시작점 블록을 넣을 시작점 / 빈공간도 찾고 넣을곳도 정하는 포인터 */
-    last_bp = heap_listp;
+    void *bp;
+    void *best_bp = NULL;
+    size_t min_diff = ~0;
 
-    /* CHUNKSIZE 바이트 크기의 가용 블록으로 빈 힙 확장 */
-    if (extend_heap(CHUNKSIZE/WSIZE) == NULL) // 4kb 확보
-        return -1; // 실패시
-    return 0;
+    for (bp = heap_listp; GET_SIZE(HDRP(bp)) > 0; bp = NEXT_BLKP(bp)) {
+        if (!GET_ALLOC(HDRP(bp)) && (asize <= GET_SIZE(HDRP(bp)))) {
+            size_t diff = GET_SIZE(HDRP(bp)) - asize;
+            if (diff < min_diff) {
+                min_diff = diff;
+                best_bp = bp;
+                if (diff == 0) break;
+            }
+        }
+    }
+    return best_bp;
 }
 
 /*
@@ -239,7 +220,15 @@ static void *coalesce(void *bp)
         bp = PREV_BLKP(bp); // 가장 앞에 있는 이전 블록 bp 반환
     }
 
-    /* 병합된 영역 내에 last_   bp가 위치해 있었다면, 유효한 블록 시작점인 bp로 갱신 */
+    /* 
+     * [Next-Fit last_bp 동기화 이유]
+     * 인접 블록들이 하나로 병합되면, 병합된 이전/이후 블록들의 기존 헤더 위치는
+     * 이제 하나의 커다란 새 블록의 "데이터(페이로드) 영역 한가운데"로 편입됨.
+     * 만약 last_bp가 병합된 영역 내부([bp, NEXT_BLKP(bp)))를 가리키고 있었다면,
+     * 다음 find_fit 순회 시 데이터 영역의 쓰레기 값을 블록 헤더로 잘못 읽게 됨.
+     * 이로 인해 힙 탐색이 깨지거나 이미 할당된 주소를 중복 반환하는
+     * 'Payload overlap' 치명적 오류가 발생하므로, 유효한 새 블록 시작점인 bp로 갱신함.
+     */
     if ((char *)last_bp >= (char *)bp && (char *)last_bp < (char *)NEXT_BLKP(bp)) {
         last_bp = bp;
     }
@@ -317,11 +306,23 @@ static void place(void *bp, size_t asize)
         bp = NEXT_BLKP(bp); // 분할된 가용 블록으로 이동
         PUT(HDRP(bp), PACK(csize-asize, 0));
         PUT(FTRP(bp), PACK(csize-asize, 0));
+        /*
+         * [분할 시 last_bp 갱신 이유]
+         * 방금 할당된 앞쪽 블록(ALLOC=1)은 건너뛰고, 분할되어 새로 생성된
+         * 뒤쪽의 '남은 가용 블록(bp)'을 다음 탐색 시작점으로 지정함.
+         * 이렇게 해야 다음 malloc 요청 시 방금 남겨둔 빈 공간을 즉시 탐색하여 재사용할 수 있음.
+         */
         last_bp = bp;       // 다음 탐색은 남은 가용 블록부터 시작
     }
     else { // 분할하지 않고 블록 전체 할당
         PUT(HDRP(bp), PACK(csize, 1));
         PUT(FTRP(bp), PACK(csize, 1));
+        /*
+         * [미분할 시 last_bp 갱신 이유]
+         * 현재 블록 전체가 할당(ALLOC=1)되었으므로, 더 이상 빈 공간이 아님.
+         * 만약 last_bp를 그대로 두면 다음 find_fit에서 방금 할당 완료된 블록을
+         * 불필요하게 다시 검사하게 되므로, 다음 블록(NEXT_BLKP(bp))으로 넘겨줌.
+         */
         last_bp = NEXT_BLKP(bp); // 다음 탐색은 다음 블록부터 시작
     }
 }
