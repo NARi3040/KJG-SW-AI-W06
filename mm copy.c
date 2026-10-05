@@ -83,7 +83,7 @@ BITWISE OR : 0001 1001 (십진수 25)
 /* 블록 포인터 bp가 주어지면, 헤더와 푸터의 주소를 계산 
 WSIZE (Word Size): 1워드 크기 (보통 4바이트)
 DSIZE (Double Word Size): 2워드 크기 (2 * WSIZE, 보통 8바이트)
-전체 블록 크기(size) = 헤더(1워드) + 페이로드 + 푸터(1워드)
+초기 전체 블록 크기(size) = 헤더(1워드) + 페이로드 + 푸터(1워드)
 
 HDRP : 페이로드 시작 주소(bp)에서 1워드(WSIZE)만큼 앞으로 되돌아가 헤더의 시작 주소를 반환
 FTRP : 페이로드 시작 주소(bp)에서 블록 크기(size)를 더한 뒤, 2워드(DSIZE)만큼 빼서 푸터의 시작 주소를 반환
@@ -238,6 +238,12 @@ static void *coalesce(void *bp)
         PUT(FTRP(NEXT_BLKP(bp)), PACK(size, 0));
         bp = PREV_BLKP(bp); // 가장 앞에 있는 이전 블록 bp 반환
     }
+
+    /* 병합된 영역 내에 last_   bp가 위치해 있었다면, 유효한 블록 시작점인 bp로 갱신 */
+    if ((char *)last_bp >= (char *)bp && (char *)last_bp < (char *)NEXT_BLKP(bp)) {
+        last_bp = bp;
+    }
+
     return bp;
 }
 
@@ -256,7 +262,7 @@ void *mm_malloc(size_t size)
 
     /* 오버헤드 및 정렬 요건을 포함하도록 블록 크기 조정 */
     if (size <= DSIZE)
-        asize = 2*DSIZE; // 8보다 작으니 8b로 고정
+        asize = 2 * DSIZE; // 8보다 작으니 8b로 고정
     else
         asize = DSIZE * ((size + (DSIZE) + (DSIZE-1)) / DSIZE); // 8의 배수로 맞춰주기
 
@@ -275,63 +281,48 @@ void *mm_malloc(size_t size)
 }
 
 /*
- find_fit - 묵시적 가용 리스트에서 First-fit(최초 적합) 방식으로 탐색
- 순회하면서 asize에 맞는 블록 찾는 순간 반환
+ find_fit - 묵시적 가용 리스트에서 Next-fit(다음 적합) 방식으로 탐색
  */
-// static void *find_fit(size_t asize)
-// {
-//     void *bp;
-
-//     for (bp = heap_listp; GET_SIZE(HDRP(bp)) > 0; bp = NEXT_BLKP(bp)) {
-//         if (!GET_ALLOC(HDRP(bp)) && (asize <= GET_SIZE(HDRP(bp)))) {
-//             return bp;
-//         }
-//     }
-//     return NULL; /* 적합한 블록 없음 */
-// }
-static void *find_fit(size_t asize) {
-    void *bp;
+static void *find_fit(size_t asize)
+{
+    char *bp;
 
     /* 1. last_bp부터 힙 끝(에필로그)까지 탐색 */
     for (bp = last_bp; GET_SIZE(HDRP(bp)) > 0; bp = NEXT_BLKP(bp)) {
         if (!GET_ALLOC(HDRP(bp)) && (asize <= GET_SIZE(HDRP(bp)))) {
-            last_bp = bp; // 찾은 지점 기억
             return bp;
         }
     }
 
-    /* 2. 끝까지 없으면, 힙 맨 처음(heap_listp)부터 last_bp 직전까지 순환 탐색 */
+    /* 2. 힙 맨 처음부터 last_bp 직전까지 순환 탐색 */
     for (bp = heap_listp; bp < last_bp; bp = NEXT_BLKP(bp)) {
         if (!GET_ALLOC(HDRP(bp)) && (asize <= GET_SIZE(HDRP(bp)))) {
-            last_bp = bp;
             return bp;
         }
     }
 
-    return NULL; /* 진짜로 자리가 없음 */
+    return NULL;
 }
-/*
-place - 가용 블록에 요청 블록을 배치하고, 남은 크기가 최소 블록 크기 이상이면 분할
-전체 빈 공간: csize
-요청한 크기: asize
-남는 공간  : csize - asize
 
+/*
+ place - 가용 블록에 요청 블록을 배치하고, 남은 크기가 최소 블록 크기 이상이면 분할
  */
 static void place(void *bp, size_t asize)
 {
     size_t csize = GET_SIZE(HDRP(bp));
 
-    if ((csize - asize) >= (2*DSIZE)) { // 남는공간이 16b이상 크면
-        // 분할
+    if ((csize - asize) >= (2*DSIZE)) { // 남는 공간이 최소 블록 크기(16B) 이상이면 분할
         PUT(HDRP(bp), PACK(asize, 1));
         PUT(FTRP(bp), PACK(asize, 1));
-        bp = NEXT_BLKP(bp); // 분할 하고 가용공간 헤더로
+        bp = NEXT_BLKP(bp); // 분할된 가용 블록으로 이동
         PUT(HDRP(bp), PACK(csize-asize, 0));
         PUT(FTRP(bp), PACK(csize-asize, 0));
+        last_bp = bp;       // 다음 탐색은 남은 가용 블록부터 시작
     }
-    else { // 아니면 풀로
+    else { // 분할하지 않고 블록 전체 할당
         PUT(HDRP(bp), PACK(csize, 1));
         PUT(FTRP(bp), PACK(csize, 1));
+        last_bp = NEXT_BLKP(bp); // 다음 탐색은 다음 블록부터 시작
     }
 }
 
