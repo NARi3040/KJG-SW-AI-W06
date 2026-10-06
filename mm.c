@@ -34,16 +34,7 @@ team_t team = {
 */
 #define CHUNKSIZE  (1<<12)  
 
-
 #define MAX(x, y) ((x) > (y)? (x) : (y)) // max함수
-
-/* 크기와 할당 비트를 하나의 워드로 패킹 
-size  (24) : 0001 1000
-alloc ( 1) : 0000 0001
------------------------
-BITWISE OR : 0001 1001 (십진수 25)
-0001 또는 0000을 넣어서 alloc 할당 여부를 판별 
-*/
 
 /*
 크기와 할당 비트를 하나의 워드로 패킹 
@@ -57,18 +48,6 @@ BITWISE OR : 0001 1001 (십진수 25)
 /* 주소 p에 있는 워드에 쓰기 */
 #define PUT(p, val)  (*(unsigned int *)(p) = (val))
 
-/* 주소 p에서 크기 및 할당 비트 읽기 
-  GET(p)  (25) : 0001 1001
-& ~0x7         : 1111 1000
----------------------------
-  결과    (24) : 0001 1000  -> 하위 3비트(할당 플래그)를 마스킹(0으로 클리어)하여 순수한 블록 크기만 추출
-  
-======================================================
-  GET(p)  (25) : 0001 1001
-& 0x1          : 0000 0001
----------------------------
-  결과    ( 1) : 0000 0001  -> 첫 비트만 AND 연산해서 할당 여부 판별
-*/
 
 /*
 주소 p에서 크기 반환
@@ -80,20 +59,6 @@ BITWISE OR : 0001 1001 (십진수 25)
 첫 비트만 AND 연산해서 할당 여부 판별
 */
 #define GET_ALLOC(p) (GET(p) & 0x1)
-
-/* 블록 포인터 bp가 주어지면, 헤더와 푸터의 주소를 계산 
-WSIZE (Word Size): 1워드 크기 (보통 4바이트)
-DSIZE (Double Word Size): 2워드 크기 (2 * WSIZE, 보통 8바이트)
-전체 블록 크기(size) = 헤더(1워드) + 페이로드 + 푸터(1워드)
-
-HDRP : 페이로드 시작 주소(bp)에서 1워드(WSIZE)만큼 앞으로 되돌아가 헤더의 시작 주소를 반환
-FTRP : 페이로드 시작 주소(bp)에서 블록 크기(size)를 더한 뒤, 2워드(DSIZE)만큼 빼서 푸터의 시작 주소를 반환
-
-헤더 주소: bp - WSIZE
-블록 전체가 끝나는 지점의 주소: 헤더 주소 + size = (bp - WSIZE) + size
-푸터의 시작 주소: 블록 끝 주소에서 푸터 크기(1워드)만큼 앞으로 이동
-푸터의 시작 주소 = ((bp - WSIZE) + size) - WSIZE = bp + size - (2 * WSIZE) = (bp + size - DSIZE)
-*/
 
 /*
 헤더 주소 반환
@@ -177,19 +142,6 @@ static void *find_fit(size_t asize);
 static void place(void *bp, size_t asize);
 static void add_free(void *bp);
 static void remove_free(void *bp);
-
-/*
-세팅
-void mem_init(void);               
-void mem_deinit(void);
-void *mem_sbrk(int incr);
-void mem_reset_brk(void); 
-void *mem_heap_lo(void);
-void *mem_heap_hi(void);
-size_t mem_heapsize(void);
-size_t mem_pagesize(void);
-
-*/
 
 /* 
  mm_init - malloc 패키지 초기화
