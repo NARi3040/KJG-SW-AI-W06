@@ -252,7 +252,7 @@ static void *coalesce(void *bp)
 
 #if USE_NEXT_FIT
     /* 
-     * [Next-Fit last_bp 동기화 이유]
+     * Next-Fit last_bp 동기화 이유
      * 인접 블록들이 하나로 병합되면, 병합된 이전/이후 블록들의 기존 헤더 위치는
      * 이제 하나의 커다란 새 블록의 "데이터(페이로드) 영역 한가운데"로 편입됨.
      * 만약 last_bp가 병합된 영역 내부([bp, NEXT_BLKP(bp)))를 가리키고 있었다면,
@@ -260,9 +260,12 @@ static void *coalesce(void *bp)
      * 이로 인해 힙 탐색이 깨지거나 이미 할당된 주소를 중복 반환하는
      * 'Payload overlap' 치명적 오류가 발생하므로, 유효한 새 블록 시작점인 bp로 갱신함.
      */
+    /* 기존: 병합 영역 안을 가리킬 때만 보정
     if ((char *)last_bp >= (char *)bp && (char *)last_bp < (char *)NEXT_BLKP(bp)) {
         last_bp = bp;
     }
+    */
+    last_bp = bp; /* 병합 결과 블록에서 다음 탐색 시작 */
 #endif
 
     return bp;
@@ -353,7 +356,7 @@ static void place(void *bp, size_t asize)
         PUT(FTRP(bp), PACK(csize-asize, 0));
 #if USE_NEXT_FIT
         /*
-         * [분할 시 last_bp 갱신 이유]
+         * 분할 시 last_bp 갱신 이유
          * 방금 할당된 앞쪽 블록(ALLOC=1)은 건너뛰고, 분할되어 새로 생성된
          * 뒤쪽의 '남은 가용 블록(bp)'을 다음 탐색 시작점으로 지정함.
          * 이렇게 해야 다음 malloc 요청 시 방금 남겨둔 빈 공간을 즉시 탐색하여 재사용할 수 있음.
@@ -366,7 +369,7 @@ static void place(void *bp, size_t asize)
         PUT(FTRP(bp), PACK(csize, 1));
 #if USE_NEXT_FIT
         /*
-         * [미분할 시 last_bp 갱신 이유]
+         * 미분할 시 last_bp 갱신 이유
          * 현재 블록 전체가 할당(ALLOC=1)되었으므로, 더 이상 빈 공간이 아님.
          * 만약 last_bp를 그대로 두면 다음 find_fit에서 방금 할당 완료된 블록을
          * 불필요하게 다시 검사하게 되므로, 다음 블록(NEXT_BLKP(bp))으로 넘겨줌.
@@ -384,7 +387,7 @@ void *mm_realloc(void *ptr, size_t size)
 {
 #if USE_OPT_REALLOC
     /*
-     * [최적화 Realloc (USE_OPT_REALLOC = 1)]
+     * 최적화 Realloc (USE_OPT_REALLOC = 1)
      * 1) 크기 축소/유지: 제자리 반환 + 16B 이상 남으면 분할
      * 2) 다음 블록이 가용 블록: 흡수하여 크기 충족 시 memcpy 없이 제자리 확장
      * 3) 다음 블록이 에필로그: 힙 끝 부족분만 mem_sbrk로 늘려 memcpy 없이 제자리 확장
@@ -426,6 +429,7 @@ void *mm_realloc(void *ptr, size_t size)
     /* 케이스 2: 다음 블록이 FREE이고 합쳐서 충분할 때 병합 */
     else if (!GET_ALLOC(HDRP(NEXT_BLKP(oldptr))) && (csize + GET_SIZE(HDRP(NEXT_BLKP(oldptr)))) >= asize) {
         size_t total_size = csize + GET_SIZE(HDRP(NEXT_BLKP(oldptr)));
+        char *old_next = NEXT_BLKP(oldptr); /* 흡수될 다음 블록 (last_bp 보정용) */
         if ((total_size - asize) >= (2 * DSIZE)) {
             PUT(HDRP(oldptr), PACK(asize, 1));
             PUT(FTRP(oldptr), PACK(asize, 1));
@@ -438,6 +442,11 @@ void *mm_realloc(void *ptr, size_t size)
             PUT(HDRP(oldptr), PACK(total_size, 1));
             PUT(FTRP(oldptr), PACK(total_size, 1));
         }
+#if USE_NEXT_FIT
+        /* 흡수된 블록의 헤더는 사라지므로 last_bp가 가리키고 있었다면 유효한 블록으로 이동 */
+        if (last_bp == old_next)
+            last_bp = NEXT_BLKP(oldptr);
+#endif
         return oldptr;
     }
     /* 케이스 3: 다음 블록이 힙 끝(에필로그 헤더)인 경우 제자리 확장 */
@@ -466,7 +475,7 @@ void *mm_realloc(void *ptr, size_t size)
     }
 #else
     /*
-     * [단순 Naive Realloc (USE_OPT_REALLOC = 0)]
+     * 단순 Naive Realloc (USE_OPT_REALLOC = 0)
      * 크기 증감과 무관하게 항상 새 블록을 malloc 후 페이로드를 복사하고 기존 블록 free
      */
     if (ptr == NULL)
