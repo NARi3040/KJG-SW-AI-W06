@@ -124,9 +124,9 @@ bp - WSIZE
 /* 명시적 가용 리스트: 가용 블록 payload 앞 두 워드(8B 포인터)에 PRED/SUCC 저장 */
 #define MINBLK  24  /* 헤더4 + PRED8 + SUCC8 + 푸터4 */
 /* PRED: 리스트의 이전 가용 블록 포인터. payload 시작(bp+0)에 저장 */
-#define PRED(bp) (*(void *)(bp))
+#define PRED(bp) (*(void **)(bp))
 /* SUCC: 리스트의 다음 가용 블록 포인터. bp+8에 저장 (char*로 바이트 단위 계산) */
-#define SUCC(bp) (*(void *)((char *)(bp) + DSIZE))
+#define SUCC(bp) (*(void **)((char *)(bp) + DSIZE))
 
 static char *heap_listp;  /* 프롤로그 블록을 가리키는 포인터 */
 static void *free_listp;  /* 가용 리스트 head (LIFO) */
