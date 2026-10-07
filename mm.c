@@ -274,6 +274,22 @@ static void *coalesce(void *bp)
 
 /* 
  * mm_malloc - 가용 리스트에서 블록 할당
+
+ mm_malloc에서 find_fit이 NULL을 반환한 뒤, extendsize = MAX(asize, CHUNKSIZE); 바로 다음임. extend_heap 호출 전에 extendsize를 보정하는 단계를 하나 넣음.
+
+절차
+
+1. 힙 끝 블록의 푸터 위치를 구함.
+   - mem_heap_hi()는 힙의 마지막 바이트 주소를 반환하므로 + 1이 힙 끝 다음 주소임. 이 주소가 에필로그 블록의 bp임. 에필로그는 헤더 4B뿐이라 헤더가 bp - WSIZE에서 끝나는 구조 때문임.
+   - 그 바로 앞(bp - DSIZE)이 마지막 일반 블록의 푸터임. 푸터는 헤더와 같은 크기·할당 정보를 가지므로 여기서 읽으면 됨.
+   - 반환형이 void *라 바이트 단위 계산을 하려면 char *로 캐스팅해야 함.
+2. 그 푸터의 할당 비트(GET_ALLOC)를 확인함.
+   - 할당됨: extendsize를 그대로 둠.
+   - 가용: 3번으로 감.
+3. extendsize = asize - GET_SIZE(푸터)로 바꿈.
+   - 이 블록은 extend_heap 안의 coalesce가 새 영역과 합쳐 줌. 그래서 필요한 총량 asize에서 이미 있는 가용 크기만 빼고 확장하면 됨.
+   - find_fit이 이미 실패했으니 가용 끝 블록은 asize보다 작아서 결과가 양수임. 별도 음수 검사는 필요 없음.
+4. 이후는 기존 그대로임. extend_heap(extendsize/WSIZE) 호출, 반환된 bp로 place, 위치 보정, 반환.
  */
 void *mm_malloc(size_t size)
 {
@@ -297,6 +313,12 @@ void *mm_malloc(size_t size)
 
     /* 적합한 블록을 찾지 못한 경우: 힙을 확장한 후 블록 배치 */
     extendsize = MAX(asize, CHUNKSIZE);
+
+    void *last_ftr = (char *)mem_heap_hi() + 1 - DSIZE;
+    if (!GET_ALLOC(last_ftr)) {
+        size_t last_free_size = GET_SIZE(last_ftr);
+        extendsize = asize - last_free_size;
+    }
 
     if ((bp = extend_heap(extendsize / WSIZE)) == NULL)
         return NULL;
@@ -330,25 +352,6 @@ static void *find_fit(size_t asize)
 /*
  * place - 가용 블록에 요청 블록을 배치하고, 남은 크기가 최소 블록 크기 이상이면 분할
  */
-// static void place(void *bp, size_t asize)
-// {
-//     size_t csize = GET_SIZE(HDRP(bp));
-
-//     remove_free(bp);
-//     if ((csize - asize) >= MINBLK) { // 남는 공간이 최소 블록 크기(16B) 이상이면 분할
-//         PUT(HDRP(bp), PACK(asize, 1));
-//         PUT(FTRP(bp), PACK(asize, 1));
-//         bp = NEXT_BLKP(bp); // 분할된 가용 블록으로 이동
-//         PUT(HDRP(bp), PACK(csize-asize, 0));
-//         PUT(FTRP(bp), PACK(csize-asize, 0));
-//         add_free(bp); // 뒤 블록은 할당 블록이라 병합 불필요
-//     }
-//     else { // 분할하지 않고 블록 전체 할당
-//         PUT(HDRP(bp), PACK(csize, 1));
-//         PUT(FTRP(bp), PACK(csize, 1));
-//     }
-// }
-
 static void place(void *bp, size_t asize)
 {
     size_t csize = GET_SIZE(HDRP(bp));
