@@ -290,14 +290,20 @@ void *mm_malloc(size_t size)
     /* 가용 리스트에서 적합한 블록 검색 */
     if ((bp = find_fit(asize)) != NULL) {
         place(bp, asize);
+        if (!GET_ALLOC(HDRP(bp))) /* 뒤에서 자른 경우: 할당 블록은 앞쪽 가용 블록 바로 뒤 */
+            bp = NEXT_BLKP(bp);
         return bp;
     }
 
     /* 적합한 블록을 찾지 못한 경우: 힙을 확장한 후 블록 배치 */
-    extendsize = MAX(asize,CHUNKSIZE);
-    if ((bp = extend_heap(extendsize/WSIZE)) == NULL)
+    extendsize = MAX(asize, CHUNKSIZE);
+
+    if ((bp = extend_heap(extendsize / WSIZE)) == NULL)
         return NULL;
+
     place(bp, asize);
+    if (!GET_ALLOC(HDRP(bp)))
+        bp = NEXT_BLKP(bp);
     return bp;
 }
 
@@ -324,20 +330,47 @@ static void *find_fit(size_t asize)
 /*
  * place - 가용 블록에 요청 블록을 배치하고, 남은 크기가 최소 블록 크기 이상이면 분할
  */
+// static void place(void *bp, size_t asize)
+// {
+//     size_t csize = GET_SIZE(HDRP(bp));
+
+//     remove_free(bp);
+//     if ((csize - asize) >= MINBLK) { // 남는 공간이 최소 블록 크기(16B) 이상이면 분할
+//         PUT(HDRP(bp), PACK(asize, 1));
+//         PUT(FTRP(bp), PACK(asize, 1));
+//         bp = NEXT_BLKP(bp); // 분할된 가용 블록으로 이동
+//         PUT(HDRP(bp), PACK(csize-asize, 0));
+//         PUT(FTRP(bp), PACK(csize-asize, 0));
+//         add_free(bp); // 뒤 블록은 할당 블록이라 병합 불필요
+//     }
+//     else { // 분할하지 않고 블록 전체 할당
+//         PUT(HDRP(bp), PACK(csize, 1));
+//         PUT(FTRP(bp), PACK(csize, 1));
+//     }
+// }
+
 static void place(void *bp, size_t asize)
 {
     size_t csize = GET_SIZE(HDRP(bp));
 
     remove_free(bp);
-    if ((csize - asize) >= MINBLK) { // 남는 공간이 최소 블록 크기(16B) 이상이면 분할
-        PUT(HDRP(bp), PACK(asize, 1));
-        PUT(FTRP(bp), PACK(asize, 1));
-        bp = NEXT_BLKP(bp); // 분할된 가용 블록으로 이동
-        PUT(HDRP(bp), PACK(csize-asize, 0));
-        PUT(FTRP(bp), PACK(csize-asize, 0));
-        add_free(bp); // 뒤 블록은 할당 블록이라 병합 불필요
-    }
-    else { // 분할하지 않고 블록 전체 할당
+    if ((csize - asize) >= MINBLK) {
+        if (asize >= 96) {                  /* 큰 블록: 뒤에서 자름 */
+            PUT(HDRP(bp), PACK(csize - asize, 0));   /* 앞쪽 free */
+            PUT(FTRP(bp), PACK(csize - asize, 0));
+            add_free(bp);
+            bp = NEXT_BLKP(bp);
+            PUT(HDRP(bp), PACK(asize, 1));           /* 뒤쪽 할당 */
+            PUT(FTRP(bp), PACK(asize, 1));
+        } else {                            /* 작은 블록: 앞에서 자름 */
+            PUT(HDRP(bp), PACK(asize, 1));
+            PUT(FTRP(bp), PACK(asize, 1));
+            bp = NEXT_BLKP(bp);
+            PUT(HDRP(bp), PACK(csize - asize, 0));
+            PUT(FTRP(bp), PACK(csize - asize, 0));
+            add_free(bp);
+        }
+    } else {
         PUT(HDRP(bp), PACK(csize, 1));
         PUT(FTRP(bp), PACK(csize, 1));
     }
